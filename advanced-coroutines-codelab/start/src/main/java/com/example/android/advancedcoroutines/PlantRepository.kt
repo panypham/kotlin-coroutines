@@ -16,8 +16,17 @@
 
 package com.example.android.advancedcoroutines
 
+import androidx.annotation.AnyThread
+import androidx.lifecycle.LiveData
+import androidx.lifecycle.liveData
+import androidx.lifecycle.map
+import androidx.lifecycle.switchMap
+import com.example.android.advancedcoroutines.util.CacheOnSuccess
+import com.example.android.advancedcoroutines.utils.ComparablePair
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.withContext
 
 /**
  * Repository module for handling data operations.
@@ -33,12 +42,67 @@ class PlantRepository private constructor(
     private val plantService: NetworkService,
     private val defaultDispatcher: CoroutineDispatcher = Dispatchers.Default
 ) {
+    private var plantListSortOrderCache =
+        CacheOnSuccess(onErrorFallback = { listOf<String>() }) {
+            plantService.customPlantSortOrder()
+        }
+
+    private fun List<Plant>.applySort(customSortOrder: List<String>): List<Plant> {
+        return sortedBy { plant ->
+            val positionForItem = customSortOrder.indexOf(plant.plantId).let { order ->
+                if (order > -1) order else Int.MAX_VALUE
+            }
+            ComparablePair(positionForItem, plant.name)
+        }
+    }
+
+    @AnyThread
+    suspend fun List<Plant>.applyMainSafeSort(customSortOrder: List<String>) =
+        withContext(defaultDispatcher) {
+            this@applyMainSafeSort.applySort(customSortOrder)
+        }
+
+    val plantsFlow: Flow<List<Plant>>
+        get() = plantDao.getPlantsFlow()
+            // When the result of customSortFlow is available,
+            // this will combine it with the latest value from
+            // the flow above.  Thus, as long as both `plants`
+            // and `sortOrder` are have an initial value (their
+            // flow has emitted at least one value), any change
+            // to either `plants` or `sortOrder`  will call
+            // `plants.applySort(sortOrder)`.
+            .combine(customSortFlow) { plants, sortOrder ->
+                plants.applySort(sortOrder)
+            }
+            .flowOn(defaultDispatcher)
+            .conflate()
+
+    fun getPlantWithGrowZoneFlow(growZoneNumber: GrowZone): Flow<List<Plant>> {
+        return plantDao.getPlantsWithGrowZoneNumberFlow(growZoneNumber.number)
+    }
+
+    private val customSortFlow = plantListSortOrderCache::getOrAwait.asFlow()
+
+    fun getPlantsWithGrowZoneFlow(growZone: GrowZone): Flow<List<Plant>> {
+        return plantDao.getPlantsWithGrowZoneNumberFlow(growZone.number)
+            .map { plantList ->
+                val sortOrderFromNetwork = plantListSortOrderCache.getOrAwait()
+                val nextValue = plantList.applyMainSafeSort(sortOrderFromNetwork)
+                nextValue
+            }
+    }
 
     /**
      * Fetch a list of [Plant]s from the database.
      * Returns a LiveData-wrapped List of Plants.
      */
-    val plants = plantDao.getPlants()
+    val plants: LiveData<List<Plant>> = liveData<List<Plant>> {
+        val plantsLiveData = plantDao.getPlants()
+        val customSortOrder = plantListSortOrderCache.getOrAwait()
+        emitSource(plantsLiveData.map { plantList ->
+            plantList.applySort(customSortOrder)
+        })
+    }
 
     /**
      * Fetch a list of [Plant]s from the database that matches a given [GrowZone].
@@ -46,6 +110,12 @@ class PlantRepository private constructor(
      */
     fun getPlantsWithGrowZone(growZone: GrowZone) =
         plantDao.getPlantsWithGrowZoneNumber(growZone.number)
+            .switchMap { plantList ->
+                liveData {
+                    val customSortOrder = plantListSortOrderCache.getOrAwait()
+                    emit(plantList.applyMainSafeSort(customSortOrder))
+                }
+            }
 
     /**
      * Returns true if we should make a network request.
@@ -94,7 +164,8 @@ class PlantRepository private constructor(
     companion object {
 
         // For Singleton instantiation
-        @Volatile private var instance: PlantRepository? = null
+        @Volatile
+        private var instance: PlantRepository? = null
 
         fun getInstance(plantDao: PlantDao, plantService: NetworkService) =
             instance ?: synchronized(this) {
